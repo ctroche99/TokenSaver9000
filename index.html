@@ -1,0 +1,687 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>TokenSaver9000 — DOCX to Markdown</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    background: #0f1117;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 2rem 1rem;
+  }
+
+  h1 {
+    font-size: 1.8rem;
+    margin-bottom: 0.25rem;
+    color: #fff;
+  }
+
+  .subtitle {
+    color: #888;
+    margin-bottom: 1.5rem;
+    font-size: 0.95rem;
+  }
+
+  .drop-zone {
+    width: 100%;
+    max-width: 1400px;
+    border: 2px dashed #3a3f4b;
+    border-radius: 12px;
+    padding: 3rem 2rem;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+    background: #161822;
+    margin-bottom: 1.5rem;
+  }
+
+  .drop-zone:hover, .drop-zone.drag-over {
+    border-color: #6c8cff;
+    background: #1a1e2e;
+  }
+
+  .drop-zone p { font-size: 1.05rem; color: #aaa; }
+  .drop-zone .browse { color: #6c8cff; text-decoration: underline; cursor: pointer; }
+
+  #file-input { display: none; }
+
+  .output-area {
+    width: 100%;
+    max-width: 1400px;
+    display: none;
+    flex-direction: column;
+    gap: 0.75rem;
+  }
+
+  .output-area.visible { display: flex; }
+
+  .file-name {
+    font-size: 0.9rem;
+    color: #888;
+  }
+
+  .actions {
+    display: flex;
+    gap: 0.5rem;
+  }
+
+  button {
+    padding: 0.55rem 1.2rem;
+    border: none;
+    border-radius: 6px;
+    font-size: 0.9rem;
+    cursor: pointer;
+    transition: background 0.2s;
+  }
+
+  .btn-primary { background: #6c8cff; color: #fff; }
+  .btn-primary:hover { background: #5a7ae6; }
+  .btn-secondary { background: #2a2e3a; color: #ccc; }
+  .btn-secondary:hover { background: #353a48; }
+
+  #markdown-output {
+    width: 100%;
+    min-height: 350px;
+    background: #1a1d28;
+    border: 1px solid #2a2e3a;
+    border-radius: 8px;
+    padding: 1rem;
+    color: #d4d4d4;
+    font-family: 'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    font-size: 0.85rem;
+    line-height: 1.55;
+    resize: vertical;
+    tab-size: 4;
+  }
+
+  .toast {
+    position: fixed;
+    bottom: 1.5rem;
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    background: #2d3348;
+    color: #e0e0e0;
+    padding: 0.6rem 1.2rem;
+    border-radius: 8px;
+    font-size: 0.85rem;
+    opacity: 0;
+    transition: opacity 0.3s, transform 0.3s;
+    pointer-events: none;
+  }
+
+  .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+  .stats {
+    font-size: 0.8rem;
+    color: #666;
+    display: flex;
+    gap: 1.5rem;
+  }
+
+  .savings-banner {
+    width: 100%;
+    max-width: 1400px;
+    background: linear-gradient(135deg, #1a2a1a, #1a2e1e);
+    border: 1px solid #2a4a2a;
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    display: none;
+    gap: 1rem;
+    align-items: center;
+    margin-bottom: 0.75rem;
+  }
+
+  .savings-banner.visible { display: flex; }
+
+  .savings-pct {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: #5cdf5c;
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .savings-detail {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    font-size: 0.82rem;
+    color: #a0b8a0;
+  }
+
+  .savings-detail strong { color: #cde6cd; }
+
+  .savings-bar-track {
+    width: 100%;
+    height: 6px;
+    background: #2a3a2a;
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: 0.15rem;
+  }
+
+  .savings-bar-fill {
+    height: 100%;
+    background: #5cdf5c;
+    border-radius: 3px;
+    transition: width 0.6s ease;
+  }
+</style>
+</head>
+<body>
+
+<h1>TokenSaver9000</h1>
+<p class="subtitle">Convert .docx to clean Markdown — save tokens, keep formatting</p>
+
+<div class="drop-zone" id="drop-zone">
+  <p>Drag &amp; drop a <strong>.docx</strong> file here</p>
+  <p>or <span class="browse" id="browse-btn">browse files</span></p>
+</div>
+<input type="file" id="file-input" accept=".docx">
+
+<div class="savings-banner" id="savings-banner">
+  <div class="savings-pct" id="savings-pct"></div>
+  <div style="flex:1;">
+    <div class="savings-detail" id="savings-detail"></div>
+    <div class="savings-bar-track"><div class="savings-bar-fill" id="savings-bar"></div></div>
+  </div>
+</div>
+
+<div class="output-area" id="output-area">
+  <div style="display:flex; justify-content:space-between; align-items:center;">
+    <span class="file-name" id="file-name"></span>
+    <div class="stats" id="stats"></div>
+  </div>
+  <div class="actions">
+    <button class="btn-primary" id="download-btn">Download .md</button>
+    <button class="btn-secondary" id="copy-btn">Copy to clipboard</button>
+  </div>
+  <textarea id="markdown-output" spellcheck="false"></textarea>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script>
+// ─── DOM refs ───────────────────────────────────────────────────
+const dropZone = document.getElementById('drop-zone');
+const fileInput = document.getElementById('file-input');
+const browseBtn = document.getElementById('browse-btn');
+const outputArea = document.getElementById('output-area');
+const mdOutput = document.getElementById('markdown-output');
+const downloadBtn = document.getElementById('download-btn');
+const copyBtn = document.getElementById('copy-btn');
+const fileNameEl = document.getElementById('file-name');
+const statsEl = document.getElementById('stats');
+const toastEl = document.getElementById('toast');
+const savingsBanner = document.getElementById('savings-banner');
+const savingsPct = document.getElementById('savings-pct');
+const savingsDetail = document.getElementById('savings-detail');
+const savingsBar = document.getElementById('savings-bar');
+
+let currentFileName = '';
+
+// ─── UI wiring ──────────────────────────────────────────────────
+browseBtn.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('click', (e) => { if (e.target !== browseBtn) fileInput.click(); });
+
+dropZone.addEventListener('dragover', (e) => { e.preventDefault(); dropZone.classList.add('drag-over'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('drag-over'));
+dropZone.addEventListener('drop', (e) => {
+  e.preventDefault();
+  dropZone.classList.remove('drag-over');
+  if (e.dataTransfer.files.length) handleFile(e.dataTransfer.files[0]);
+});
+
+fileInput.addEventListener('change', () => { if (fileInput.files.length) handleFile(fileInput.files[0]); });
+
+downloadBtn.addEventListener('click', () => {
+  const blob = new Blob([mdOutput.value], { type: 'text/markdown' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = currentFileName.replace(/\.docx$/i, '') + '.md';
+  a.click();
+  URL.revokeObjectURL(a.href);
+});
+
+copyBtn.addEventListener('click', () => {
+  navigator.clipboard.writeText(mdOutput.value).then(() => showToast('Copied to clipboard'));
+});
+
+function showToast(msg) {
+  toastEl.textContent = msg;
+  toastEl.classList.add('show');
+  setTimeout(() => toastEl.classList.remove('show'), 2000);
+}
+
+// ─── Main handler ───────────────────────────────────────────────
+async function handleFile(file) {
+  if (!file.name.toLowerCase().endsWith('.docx')) {
+    showToast('Please upload a .docx file');
+    return;
+  }
+  currentFileName = file.name;
+  fileNameEl.textContent = file.name;
+
+  try {
+    const { markdown: md, xmlSize } = await convertDocxToMarkdown(file);
+    mdOutput.value = md;
+    outputArea.classList.add('visible');
+
+    const mdSize = md.length;
+    const mdTokens = Math.round(mdSize / 4);
+    const xmlTokens = Math.round(xmlSize / 4);
+    const saved = xmlSize - mdSize;
+    const savedPct = xmlSize > 0 ? Math.round((saved / xmlSize) * 100) : 0;
+
+    statsEl.textContent = `${mdSize.toLocaleString()} chars · ~${mdTokens.toLocaleString()} tokens`;
+
+    savingsPct.textContent = `${savedPct}%`;
+    savingsDetail.innerHTML =
+      `<span><strong>XML source:</strong> ~${xmlTokens.toLocaleString()} tokens (${xmlSize.toLocaleString()} chars)</span>` +
+      `<span><strong>Markdown:</strong> ~${mdTokens.toLocaleString()} tokens (${mdSize.toLocaleString()} chars)</span>` +
+      `<span><strong>Saved:</strong> ~${(xmlTokens - mdTokens).toLocaleString()} tokens</span>`;
+    savingsBar.style.width = savedPct + '%';
+    savingsBanner.classList.add('visible');
+
+    showToast('Conversion complete');
+  } catch (err) {
+    console.error(err);
+    showToast('Error converting file — see console');
+  }
+}
+
+// ─── DOCX → Markdown converter ─────────────────────────────────
+
+async function convertDocxToMarkdown(file) {
+  const zip = await JSZip.loadAsync(file);
+
+  // Parse main document — also measure total XML size for savings stat
+  const docXml = await zip.file('word/document.xml').async('string');
+  let xmlSize = docXml.length;
+  const docDom = new DOMParser().parseFromString(docXml, 'application/xml');
+
+  // Parse numbering definitions (if present)
+  let numberingMap = {};  // numId → abstractNumId
+  let abstractNums = {};  // abstractNumId → { levels: { ilvl: { numFmt, lvlText, start } } }
+  const numFile = zip.file('word/numbering.xml');
+  if (numFile) {
+    const numXml = await numFile.async('string');
+    xmlSize += numXml.length;
+    const numDom = new DOMParser().parseFromString(numXml, 'application/xml');
+    parseNumbering(numDom, numberingMap, abstractNums);
+  }
+
+  // Parse styles for heading detection
+  let styleMap = {}; // styleId → { name, outlineLvl }
+  const stylesFile = zip.file('word/styles.xml');
+  if (stylesFile) {
+    const stylesXml = await stylesFile.async('string');
+    xmlSize += stylesXml.length;
+    const stylesDom = new DOMParser().parseFromString(stylesXml, 'application/xml');
+    parseStyles(stylesDom, styleMap);
+  }
+
+  // Parse relationships for hyperlinks
+  let relMap = {};
+  const relsFile = zip.file('word/_rels/document.xml.rels');
+  if (relsFile) {
+    const relsXml = await relsFile.async('string');
+    xmlSize += relsXml.length;
+    const relsDom = new DOMParser().parseFromString(relsXml, 'application/xml');
+    parseRelationships(relsDom, relMap);
+  }
+
+  // Track list counters: key = "numId-ilvl" → current count
+  const listCounters = {};
+
+  // Track previous paragraph's numId+ilvl to detect counter resets
+  let prevNumId = null;
+
+  const body = docDom.getElementsByTagName('w:body')[0];
+  const paragraphs = body.children;
+  const lines = [];
+
+  for (let i = 0; i < paragraphs.length; i++) {
+    const node = paragraphs[i];
+    const tag = node.localName || node.nodeName;
+
+    if (tag === 'p') {
+      lines.push(processParagraph(node, styleMap, numberingMap, abstractNums, listCounters, relMap));
+    } else if (tag === 'tbl') {
+      lines.push(processTable(node, relMap));
+    }
+  }
+
+  return { markdown: collapseBlankLines(lines.join('\n')), xmlSize };
+}
+
+// ─── Numbering parser ───────────────────────────────────────────
+
+function parseNumbering(dom, numberingMap, abstractNums) {
+  // Parse abstractNum definitions
+  const absEls = dom.getElementsByTagName('w:abstractNum');
+  for (const abs of absEls) {
+    const absId = abs.getAttribute('w:abstractNumId');
+    const levels = {};
+    const lvlEls = abs.getElementsByTagName('w:lvl');
+    for (const lvl of lvlEls) {
+      const ilvl = lvl.getAttribute('w:ilvl');
+      const numFmtEl = lvl.getElementsByTagName('w:numFmt')[0];
+      const lvlTextEl = lvl.getElementsByTagName('w:lvlText')[0];
+      const startEl = lvl.getElementsByTagName('w:start')[0];
+      levels[ilvl] = {
+        numFmt: numFmtEl ? numFmtEl.getAttribute('w:val') : 'decimal',
+        lvlText: lvlTextEl ? lvlTextEl.getAttribute('w:val') : '%1.',
+        start: startEl ? parseInt(startEl.getAttribute('w:val'), 10) : 1,
+      };
+    }
+    abstractNums[absId] = { levels };
+  }
+
+  // Map numId → abstractNumId
+  const numEls = dom.getElementsByTagName('w:num');
+  for (const num of numEls) {
+    const numId = num.getAttribute('w:numId');
+    const absRef = num.getElementsByTagName('w:abstractNumId')[0];
+    if (absRef) {
+      numberingMap[numId] = absRef.getAttribute('w:val');
+    }
+  }
+}
+
+// ─── Styles parser ──────────────────────────────────────────────
+
+function parseStyles(dom, styleMap) {
+  const styles = dom.getElementsByTagName('w:style');
+  for (const s of styles) {
+    const id = s.getAttribute('w:styleId');
+    const nameEl = s.getElementsByTagName('w:name')[0];
+    const name = nameEl ? nameEl.getAttribute('w:val') : '';
+
+    let outlineLvl = null;
+    const pPr = s.getElementsByTagName('w:pPr')[0];
+    if (pPr) {
+      const olvl = pPr.getElementsByTagName('w:outlineLvl')[0];
+      if (olvl) outlineLvl = parseInt(olvl.getAttribute('w:val'), 10);
+    }
+
+    // Detect heading level from style name as fallback
+    if (outlineLvl === null) {
+      const m = name.match(/^heading\s+(\d+)/i);
+      if (m) outlineLvl = parseInt(m[1], 10) - 1;
+    }
+
+    styleMap[id] = { name, outlineLvl };
+  }
+}
+
+// ─── Relationships parser ───────────────────────────────────────
+
+function parseRelationships(dom, relMap) {
+  const rels = dom.getElementsByTagName('Relationship');
+  for (const r of rels) {
+    relMap[r.getAttribute('Id')] = {
+      type: r.getAttribute('Type'),
+      target: r.getAttribute('Target'),
+    };
+  }
+}
+
+// ─── Paragraph processor ────────────────────────────────────────
+
+function processParagraph(pNode, styleMap, numberingMap, abstractNums, listCounters, relMap) {
+  const pPr = getChild(pNode, 'w:pPr');
+
+  // Determine heading level
+  let headingLevel = 0;
+  if (pPr) {
+    const pStyle = getChild(pPr, 'w:pStyle');
+    if (pStyle) {
+      const styleId = pStyle.getAttribute('w:val');
+      const style = styleMap[styleId];
+      if (style && style.outlineLvl !== null && style.outlineLvl !== undefined) {
+        headingLevel = style.outlineLvl + 1; // 0-based → 1-based
+      }
+    }
+  }
+
+  // Determine list info
+  let listPrefix = '';
+  if (pPr) {
+    const numPr = getChild(pPr, 'w:numPr');
+    if (numPr) {
+      const ilvlEl = getChild(numPr, 'w:ilvl');
+      const numIdEl = getChild(numPr, 'w:numId');
+      if (numIdEl) {
+        const numId = numIdEl.getAttribute('w:val');
+        const ilvl = ilvlEl ? ilvlEl.getAttribute('w:val') : '0';
+
+        // numId "0" means no numbering
+        if (numId !== '0') {
+          const absId = numberingMap[numId];
+          if (absId !== undefined && abstractNums[absId]) {
+            const lvlDef = abstractNums[absId].levels[ilvl];
+            if (lvlDef) {
+              const indent = '  '.repeat(parseInt(ilvl, 10));
+
+              if (lvlDef.numFmt === 'bullet') {
+                listPrefix = indent + '- ';
+              } else {
+                // Numbered list — track counter
+                const counterKey = numId + '-' + ilvl;
+                if (listCounters[counterKey] === undefined) {
+                  listCounters[counterKey] = lvlDef.start || 1;
+                } else {
+                  listCounters[counterKey]++;
+                }
+
+                // Reset sub-level counters when parent advances
+                const curIlvl = parseInt(ilvl, 10);
+                for (const key of Object.keys(listCounters)) {
+                  const [kNumId, kIlvl] = key.split('-');
+                  if (kNumId === numId && parseInt(kIlvl, 10) > curIlvl) {
+                    delete listCounters[key];
+                  }
+                }
+
+                const num = listCounters[counterKey];
+                const formatted = formatNumber(num, lvlDef.numFmt);
+                // Build level text by replacing placeholders
+                let text = lvlDef.lvlText;
+                text = text.replace(/%(\d+)/g, (_, lvlIdx) => {
+                  const li = parseInt(lvlIdx, 10) - 1;
+                  const k = numId + '-' + li;
+                  const val = listCounters[k] || lvlDef.start || 1;
+                  if (li === parseInt(ilvl, 10)) return formatted;
+                  return formatNumber(val, 'decimal');
+                });
+                listPrefix = indent + text + ' ';
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // Extract runs
+  const text = extractRuns(pNode, relMap);
+
+  if (!text && !listPrefix) return '';
+
+  // Apply heading
+  if (headingLevel > 0 && headingLevel <= 6) {
+    return '#'.repeat(headingLevel) + ' ' + text;
+  }
+
+  return listPrefix + text;
+}
+
+// ─── Run extractor ──────────────────────────────────────────────
+
+function extractRuns(parentNode, relMap) {
+  let result = '';
+
+  for (const child of parentNode.children) {
+    const tag = child.localName || child.nodeName;
+
+    if (tag === 'r') {
+      result += processRun(child);
+    } else if (tag === 'hyperlink') {
+      const rId = child.getAttribute('r:id');
+      const url = (rId && relMap[rId]) ? relMap[rId].target : '';
+      let linkText = '';
+      for (const rc of child.children) {
+        if ((rc.localName || rc.nodeName) === 'r') {
+          linkText += processRun(rc, true);
+        }
+      }
+      if (url) {
+        result += '[' + linkText + '](' + url + ')';
+      } else {
+        result += linkText;
+      }
+    }
+  }
+
+  return result;
+}
+
+function processRun(rNode, skipFormatting) {
+  const rPr = getChild(rNode, 'w:rPr');
+  let text = '';
+
+  for (const child of rNode.children) {
+    const tag = child.localName || child.nodeName;
+    if (tag === 't') {
+      text += child.textContent;
+    } else if (tag === 'tab') {
+      text += '\t';
+    } else if (tag === 'br') {
+      text += '\n';
+    } else if (tag === 'sym') {
+      // Symbol characters — try to render as unicode
+      text += '\u2022'; // default to bullet
+    }
+  }
+
+  if (!text || skipFormatting) return text;
+
+  // Detect formatting
+  let bold = false, italic = false, strike = false, underline = false;
+
+  if (rPr) {
+    bold = hasToggleProp(rPr, 'w:b');
+    italic = hasToggleProp(rPr, 'w:i');
+    strike = hasToggleProp(rPr, 'w:strike') || hasToggleProp(rPr, 'w:dstrike');
+    const uEl = getChild(rPr, 'w:u');
+    if (uEl) {
+      const uVal = uEl.getAttribute('w:val');
+      underline = uVal && uVal !== 'none';
+    }
+  }
+
+  // Underline → bold (since md has no underline and Gemini needs to see emphasis)
+  if (underline) bold = true;
+
+  // Apply markdown formatting — order: strikethrough wraps bold wraps italic
+  if (italic) text = '*' + text + '*';
+  if (bold) text = '**' + text + '**';
+  if (strike) text = '~~' + text + '~~';
+
+  return text;
+}
+
+// ─── Table processor ────────────────────────────────────────────
+
+function processTable(tblNode, relMap) {
+  const rows = [];
+  for (const child of tblNode.children) {
+    const tag = child.localName || child.nodeName;
+    if (tag === 'tr') {
+      const cells = [];
+      for (const cell of child.children) {
+        if ((cell.localName || cell.nodeName) === 'tc') {
+          const cellParts = [];
+          for (const p of cell.children) {
+            if ((p.localName || p.nodeName) === 'p') {
+              cellParts.push(extractRuns(p, relMap));
+            }
+          }
+          cells.push(cellParts.join(' ').replace(/\|/g, '\\|'));
+        }
+      }
+      rows.push(cells);
+    }
+  }
+
+  if (rows.length === 0) return '';
+
+  const colCount = Math.max(...rows.map(r => r.length));
+  const mdLines = [];
+
+  for (let i = 0; i < rows.length; i++) {
+    const padded = rows[i].concat(Array(colCount - rows[i].length).fill(''));
+    mdLines.push('| ' + padded.join(' | ') + ' |');
+    if (i === 0) {
+      mdLines.push('| ' + padded.map(() => '---').join(' | ') + ' |');
+    }
+  }
+
+  return '\n' + mdLines.join('\n') + '\n';
+}
+
+// ─── Helpers ────────────────────────────────────────────────────
+
+function getChild(node, tagName) {
+  for (const c of node.children) {
+    if ((c.localName || c.nodeName) === tagName.split(':').pop() ||
+        c.nodeName === tagName) return c;
+  }
+  return null;
+}
+
+function hasToggleProp(rPr, propName) {
+  const el = getChild(rPr, propName);
+  if (!el) return false;
+  const val = el.getAttribute('w:val');
+  return val === null || val === '' || val === '1' || val === 'true';
+}
+
+function formatNumber(num, fmt) {
+  switch (fmt) {
+    case 'lowerLetter': return String.fromCharCode(96 + ((num - 1) % 26) + 1);
+    case 'upperLetter': return String.fromCharCode(64 + ((num - 1) % 26) + 1);
+    case 'lowerRoman': return toRoman(num).toLowerCase();
+    case 'upperRoman': return toRoman(num);
+    case 'decimal':
+    default: return String(num);
+  }
+}
+
+function toRoman(num) {
+  const vals = [1000,900,500,400,100,90,50,40,10,9,5,4,1];
+  const syms = ['M','CM','D','CD','C','XC','L','XL','X','IX','V','IV','I'];
+  let result = '';
+  for (let i = 0; i < vals.length; i++) {
+    while (num >= vals[i]) { result += syms[i]; num -= vals[i]; }
+  }
+  return result;
+}
+
+function collapseBlankLines(text) {
+  return text.replace(/\n{3,}/g, '\n\n').trim() + '\n';
+}
+</script>
+
+</body>
+</html>
