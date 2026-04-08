@@ -126,6 +126,55 @@
     display: flex;
     gap: 1.5rem;
   }
+
+  .savings-banner {
+    width: 100%;
+    max-width: 700px;
+    background: linear-gradient(135deg, #1a2a1a, #1a2e1e);
+    border: 1px solid #2a4a2a;
+    border-radius: 10px;
+    padding: 1rem 1.25rem;
+    display: none;
+    gap: 1rem;
+    align-items: center;
+    margin-bottom: 0.75rem;
+  }
+
+  .savings-banner.visible { display: flex; }
+
+  .savings-pct {
+    font-size: 1.8rem;
+    font-weight: 700;
+    color: #5cdf5c;
+    line-height: 1;
+    white-space: nowrap;
+  }
+
+  .savings-detail {
+    display: flex;
+    flex-direction: column;
+    gap: 0.2rem;
+    font-size: 0.82rem;
+    color: #a0b8a0;
+  }
+
+  .savings-detail strong { color: #cde6cd; }
+
+  .savings-bar-track {
+    width: 100%;
+    height: 6px;
+    background: #2a3a2a;
+    border-radius: 3px;
+    overflow: hidden;
+    margin-top: 0.15rem;
+  }
+
+  .savings-bar-fill {
+    height: 100%;
+    background: #5cdf5c;
+    border-radius: 3px;
+    transition: width 0.6s ease;
+  }
 </style>
 </head>
 <body>
@@ -138,6 +187,14 @@
   <p>or <span class="browse" id="browse-btn">browse files</span></p>
 </div>
 <input type="file" id="file-input" accept=".docx">
+
+<div class="savings-banner" id="savings-banner">
+  <div class="savings-pct" id="savings-pct"></div>
+  <div style="flex:1;">
+    <div class="savings-detail" id="savings-detail"></div>
+    <div class="savings-bar-track"><div class="savings-bar-fill" id="savings-bar"></div></div>
+  </div>
+</div>
 
 <div class="output-area" id="output-area">
   <div style="display:flex; justify-content:space-between; align-items:center;">
@@ -165,6 +222,10 @@ const copyBtn = document.getElementById('copy-btn');
 const fileNameEl = document.getElementById('file-name');
 const statsEl = document.getElementById('stats');
 const toastEl = document.getElementById('toast');
+const savingsBanner = document.getElementById('savings-banner');
+const savingsPct = document.getElementById('savings-pct');
+const savingsDetail = document.getElementById('savings-detail');
+const savingsBar = document.getElementById('savings-bar');
 
 let currentFileName = '';
 
@@ -211,13 +272,26 @@ async function handleFile(file) {
   fileNameEl.textContent = file.name;
 
   try {
-    const md = await convertDocxToMarkdown(file);
+    const { markdown: md, xmlSize } = await convertDocxToMarkdown(file);
     mdOutput.value = md;
     outputArea.classList.add('visible');
 
-    const charCount = md.length;
-    const approxTokens = Math.round(charCount / 4);
-    statsEl.textContent = `${charCount.toLocaleString()} chars · ~${approxTokens.toLocaleString()} tokens`;
+    const mdSize = md.length;
+    const mdTokens = Math.round(mdSize / 4);
+    const xmlTokens = Math.round(xmlSize / 4);
+    const saved = xmlSize - mdSize;
+    const savedPct = xmlSize > 0 ? Math.round((saved / xmlSize) * 100) : 0;
+
+    statsEl.textContent = `${mdSize.toLocaleString()} chars · ~${mdTokens.toLocaleString()} tokens`;
+
+    savingsPct.textContent = `${savedPct}%`;
+    savingsDetail.innerHTML =
+      `<span><strong>XML source:</strong> ~${xmlTokens.toLocaleString()} tokens (${xmlSize.toLocaleString()} chars)</span>` +
+      `<span><strong>Markdown:</strong> ~${mdTokens.toLocaleString()} tokens (${mdSize.toLocaleString()} chars)</span>` +
+      `<span><strong>Saved:</strong> ~${(xmlTokens - mdTokens).toLocaleString()} tokens</span>`;
+    savingsBar.style.width = savedPct + '%';
+    savingsBanner.classList.add('visible');
+
     showToast('Conversion complete');
   } catch (err) {
     console.error(err);
@@ -230,8 +304,9 @@ async function handleFile(file) {
 async function convertDocxToMarkdown(file) {
   const zip = await JSZip.loadAsync(file);
 
-  // Parse main document
+  // Parse main document — also measure total XML size for savings stat
   const docXml = await zip.file('word/document.xml').async('string');
+  let xmlSize = docXml.length;
   const docDom = new DOMParser().parseFromString(docXml, 'application/xml');
 
   // Parse numbering definitions (if present)
@@ -240,6 +315,7 @@ async function convertDocxToMarkdown(file) {
   const numFile = zip.file('word/numbering.xml');
   if (numFile) {
     const numXml = await numFile.async('string');
+    xmlSize += numXml.length;
     const numDom = new DOMParser().parseFromString(numXml, 'application/xml');
     parseNumbering(numDom, numberingMap, abstractNums);
   }
@@ -249,6 +325,7 @@ async function convertDocxToMarkdown(file) {
   const stylesFile = zip.file('word/styles.xml');
   if (stylesFile) {
     const stylesXml = await stylesFile.async('string');
+    xmlSize += stylesXml.length;
     const stylesDom = new DOMParser().parseFromString(stylesXml, 'application/xml');
     parseStyles(stylesDom, styleMap);
   }
@@ -258,6 +335,7 @@ async function convertDocxToMarkdown(file) {
   const relsFile = zip.file('word/_rels/document.xml.rels');
   if (relsFile) {
     const relsXml = await relsFile.async('string');
+    xmlSize += relsXml.length;
     const relsDom = new DOMParser().parseFromString(relsXml, 'application/xml');
     parseRelationships(relsDom, relMap);
   }
@@ -283,7 +361,7 @@ async function convertDocxToMarkdown(file) {
     }
   }
 
-  return collapseBlankLines(lines.join('\n'));
+  return { markdown: collapseBlankLines(lines.join('\n')), xmlSize };
 }
 
 // ─── Numbering parser ───────────────────────────────────────────
