@@ -302,66 +302,160 @@ async function handleFile(file) {
 // ─── DOCX → Markdown converter ─────────────────────────────────
 
 async function convertDocxToMarkdown(file) {
-  const zip = await JSZip.loadAsync(file);
+  const arrayBuffer = await file.arrayBuffer();
+  const zip = await JSZip.loadAsync(arrayBuffer);
 
-  // Parse main document — also measure total XML size for savings stat
-  const docXml = await zip.file('word/document.xml').async('string');
-  let xmlSize = docXml.length;
-  const docDom = new DOMParser().parseFromString(docXml, 'application/xml');
+  let xmlSize = 0;
+  const styleNumMap = {};  // styleId → numId (explicit or inherited)
+  const styleBaseMap = {}; // styleId → basedOn styleId
 
-  // Parse numbering definitions (if present)
-  let numberingMap = {};  // numId → abstractNumId
-  let abstractNums = {};  // abstractNumId → { levels: { ilvl: { numFmt, lvlText, start } } }
-  const numFile = zip.file('word/numbering.xml');
-  if (numFile) {
-    const numXml = await numFile.async('string');
-    xmlSize += numXml.length;
-    const numDom = new DOMParser().parseFromString(numXml, 'application/xml');
-    parseNumbering(numDom, numberingMap, abstractNums);
-  }
+  // 1. Parse styles.xml — build styleId → numId map with basedOn inheritance
+  if (zip.file('word/styles.xml')) {
+    const stylesXmlStr = await zip.file('word/styles.xml').async('text');
+    xmlSize += stylesXmlStr.length;
+    const stylesDoc = new DOMParser().parseFromString(stylesXmlStr, 'text/xml');
 
-  // Parse styles for heading detection
-  let styleMap = {}; // styleId → { name, outlineLvl }
-  const stylesFile = zip.file('word/styles.xml');
-  if (stylesFile) {
-    const stylesXml = await stylesFile.async('string');
-    xmlSize += stylesXml.length;
-    const stylesDom = new DOMParser().parseFromString(stylesXml, 'application/xml');
-    parseStyles(stylesDom, styleMap);
-  }
+    const styles = stylesDoc.getElementsByTagName('w:style');
+    for (let i = 0; i < styles.length; i++) {
+      const style = styles[i];
+      const type = style.getAttribute('w:type');
+      const styleId = style.getAttribute('w:styleId');
 
-  // Parse relationships for hyperlinks
-  let relMap = {};
-  const relsFile = zip.file('word/_rels/document.xml.rels');
-  if (relsFile) {
-    const relsXml = await relsFile.async('string');
-    xmlSize += relsXml.length;
-    const relsDom = new DOMParser().parseFromString(relsXml, 'application/xml');
-    parseRelationships(relsDom, relMap);
-  }
+      if (type === 'paragraph') {
+        const numIds = style.getElementsByTagName('w:numId');
+        if (numIds.length > 0) {
+          styleNumMap[styleId] = numIds[0].getAttribute('w:val');
+        }
 
-  // Track list counters: key = "numId-ilvl" → current count
-  const listCounters = {};
+        const basedOns = style.getElementsByTagName('w:basedOn');
+        if (basedOns.length > 0) {
+          styleBaseMap[styleId] = basedOns[0].getAttribute('w:val');
+        }
+      }
+    }
 
-  // Track previous paragraph's numId+ilvl to detect counter resets
-  let prevNumId = null;
-
-  const body = docDom.getElementsByTagName('w:body')[0];
-  const paragraphs = body.children;
-  const lines = [];
-
-  for (let i = 0; i < paragraphs.length; i++) {
-    const node = paragraphs[i];
-    const tag = node.localName || node.nodeName;
-
-    if (tag === 'p') {
-      lines.push(processParagraph(node, styleMap, numberingMap, abstractNums, listCounters, relMap));
-    } else if (tag === 'tbl') {
-      lines.push(processTable(node, relMap));
+    // Resolve inheritance — derived styles pick up numId from their base.
+    // Iterate until fixed point (bounded to avoid pathological loops).
+    let changed = true;
+    for (let i = 0; i < 10 && changed; i++) {
+      changed = false;
+      for (const styleId in styleBaseMap) {
+        const baseId = styleBaseMap[styleId];
+        if (!(styleId in styleNumMap) && baseId in styleNumMap) {
+          styleNumMap[styleId] = styleNumMap[baseId];
+          changed = true;
+        }
+      }
     }
   }
 
-  const rawMarkdown = collapseBlankLines(lines.join('\n'));
+  // 2. Parse document.xml
+  const markdownOutput = [];
+  if (zip.file('word/document.xml')) {
+    const docXmlStr = await zip.file('word/document.xml').async('text');
+    xmlSize += docXmlStr.length;
+    const documentDoc = new DOMParser().parseFromString(docXmlStr, 'text/xml');
+
+    const listCounters = {};
+    const paragraphs = documentDoc.getElementsByTagName('w:p');
+
+    for (let i = 0; i < paragraphs.length; i++) {
+      const p = paragraphs[i];
+
+      let pNumId = '';
+      let pStyleId = '';
+      let pFirstLineIndent = '';
+
+      // Extract paragraph properties
+      const pPrs = p.getElementsByTagName('w:pPr');
+      if (pPrs.length > 0) {
+        const pPr = pPrs[0];
+        const numIds = pPr.getElementsByTagName('w:numId');
+        if (numIds.length > 0) pNumId = numIds[0].getAttribute('w:val') || '';
+
+        const pStyles = pPr.getElementsByTagName('w:pStyle');
+        if (pStyles.length > 0) pStyleId = pStyles[0].getAttribute('w:val') || '';
+
+        const inds = pPr.getElementsByTagName('w:ind');
+        if (inds.length > 0) {
+          pFirstLineIndent = inds[0].getAttribute('w:firstLine') || '';
+        }
+      }
+
+      // Determine list context: explicit numId wins, then inherited from style.
+      const styleNum = styleNumMap[pStyleId] || '';
+      let listNum = '';
+
+      if (pNumId !== '') {
+        listNum = pNumId === '0' ? '' : pNumId;
+      } else if (styleNum !== '' && styleNum !== '0') {
+        listNum = styleNum;
+      }
+
+      let paraNumberText = '';
+      let tabText = '';
+
+      if (listNum !== '') {
+        listCounters[listNum] = (listCounters[listNum] || 0) + 1;
+        paraNumberText = listCounters[listNum] + '. ';
+      }
+
+      if (pFirstLineIndent !== '') {
+        const val = parseInt(pFirstLineIndent, 10);
+        if (!isNaN(val) && val > 0) {
+          // 1 inch = 1440 twips. 0.5 inches = 720 twips → one tab.
+          const numTabs = Math.round(val / 720.0);
+          if (numTabs > 0) tabText = '\t'.repeat(numTabs);
+        }
+      }
+
+      // Process text runs
+      let pText = '';
+      const runs = p.getElementsByTagName('w:r');
+      for (let j = 0; j < runs.length; j++) {
+        const run = runs[j];
+        let runText = '';
+        const textNodes = run.getElementsByTagName('w:t');
+        for (let k = 0; k < textNodes.length; k++) {
+          runText += textNodes[k].textContent;
+        }
+        if (!runText) continue;
+
+        let isBold = false;
+        let isItalic = false;
+        const rPrs = run.getElementsByTagName('w:rPr');
+        if (rPrs.length > 0) {
+          const rPr = rPrs[0];
+          if (rPr.getElementsByTagName('w:b').length > 0) isBold = true;
+          if (rPr.getElementsByTagName('w:i').length > 0) isItalic = true;
+        }
+
+        // Wrap the non-whitespace core with markdown emphasis
+        if (runText.trim().length > 0) {
+          const prefix = runText.match(/^\s*/)[0];
+          const suffix = runText.match(/\s*$/)[0];
+          const core = runText.trim();
+
+          let formatted = core;
+          if (isBold && isItalic) formatted = '***' + formatted + '***';
+          else if (isBold) formatted = '**' + formatted + '**';
+          else if (isItalic) formatted = '*' + formatted + '*';
+
+          runText = prefix + formatted + suffix;
+        }
+
+        pText += runText;
+      }
+
+      // Only add paragraphs that actually have content or list markers
+      const injectionText = tabText + paraNumberText;
+      if (pText.trim() !== '' || paraNumberText !== '') {
+        markdownOutput.push(injectionText + pText);
+      }
+    }
+  }
+
+  const rawMarkdown = collapseBlankLines(markdownOutput.join('\n\n'));
   return { markdown: ensureParagraphNumbers(rawMarkdown), xmlSize };
 }
 
@@ -458,319 +552,7 @@ function numberRegion(lines, start, end) {
   }
 }
 
-// ─── Numbering parser ───────────────────────────────────────────
-
-function parseNumbering(dom, numberingMap, abstractNums) {
-  // Parse abstractNum definitions
-  const absEls = dom.getElementsByTagName('w:abstractNum');
-  for (const abs of absEls) {
-    const absId = abs.getAttribute('w:abstractNumId');
-    const levels = {};
-    const lvlEls = abs.getElementsByTagName('w:lvl');
-    for (const lvl of lvlEls) {
-      const ilvl = lvl.getAttribute('w:ilvl');
-      const numFmtEl = lvl.getElementsByTagName('w:numFmt')[0];
-      const lvlTextEl = lvl.getElementsByTagName('w:lvlText')[0];
-      const startEl = lvl.getElementsByTagName('w:start')[0];
-      levels[ilvl] = {
-        numFmt: numFmtEl ? numFmtEl.getAttribute('w:val') : 'decimal',
-        lvlText: lvlTextEl ? lvlTextEl.getAttribute('w:val') : '%1.',
-        start: startEl ? parseInt(startEl.getAttribute('w:val'), 10) : 1,
-      };
-    }
-    abstractNums[absId] = { levels };
-  }
-
-  // Map numId → abstractNumId
-  const numEls = dom.getElementsByTagName('w:num');
-  for (const num of numEls) {
-    const numId = num.getAttribute('w:numId');
-    const absRef = num.getElementsByTagName('w:abstractNumId')[0];
-    if (absRef) {
-      numberingMap[numId] = absRef.getAttribute('w:val');
-    }
-  }
-}
-
-// ─── Styles parser ──────────────────────────────────────────────
-
-function parseStyles(dom, styleMap) {
-  const styles = dom.getElementsByTagName('w:style');
-  for (const s of styles) {
-    const id = s.getAttribute('w:styleId');
-    const nameEl = s.getElementsByTagName('w:name')[0];
-    const name = nameEl ? nameEl.getAttribute('w:val') : '';
-
-    let outlineLvl = null;
-    const pPr = s.getElementsByTagName('w:pPr')[0];
-    if (pPr) {
-      const olvl = pPr.getElementsByTagName('w:outlineLvl')[0];
-      if (olvl) outlineLvl = parseInt(olvl.getAttribute('w:val'), 10);
-    }
-
-    // Detect heading level from style name as fallback
-    if (outlineLvl === null) {
-      const m = name.match(/^heading\s+(\d+)/i);
-      if (m) outlineLvl = parseInt(m[1], 10) - 1;
-    }
-
-    styleMap[id] = { name, outlineLvl };
-  }
-}
-
-// ─── Relationships parser ───────────────────────────────────────
-
-function parseRelationships(dom, relMap) {
-  const rels = dom.getElementsByTagName('Relationship');
-  for (const r of rels) {
-    relMap[r.getAttribute('Id')] = {
-      type: r.getAttribute('Type'),
-      target: r.getAttribute('Target'),
-    };
-  }
-}
-
-// ─── Paragraph processor ────────────────────────────────────────
-
-function processParagraph(pNode, styleMap, numberingMap, abstractNums, listCounters, relMap) {
-  const pPr = getChild(pNode, 'w:pPr');
-
-  // Determine heading level
-  let headingLevel = 0;
-  if (pPr) {
-    const pStyle = getChild(pPr, 'w:pStyle');
-    if (pStyle) {
-      const styleId = pStyle.getAttribute('w:val');
-      const style = styleMap[styleId];
-      if (style && style.outlineLvl !== null && style.outlineLvl !== undefined) {
-        headingLevel = style.outlineLvl + 1; // 0-based → 1-based
-      }
-    }
-  }
-
-  // Determine list info
-  let listPrefix = '';
-  if (pPr) {
-    const numPr = getChild(pPr, 'w:numPr');
-    if (numPr) {
-      const ilvlEl = getChild(numPr, 'w:ilvl');
-      const numIdEl = getChild(numPr, 'w:numId');
-      if (numIdEl) {
-        const numId = numIdEl.getAttribute('w:val');
-        const ilvl = ilvlEl ? ilvlEl.getAttribute('w:val') : '0';
-
-        // numId "0" means no numbering
-        if (numId !== '0') {
-          const absId = numberingMap[numId];
-          if (absId !== undefined && abstractNums[absId]) {
-            const lvlDef = abstractNums[absId].levels[ilvl];
-            if (lvlDef) {
-              const indent = '  '.repeat(parseInt(ilvl, 10));
-
-              if (lvlDef.numFmt === 'bullet') {
-                listPrefix = indent + '- ';
-              } else {
-                // Numbered list — track counter
-                const counterKey = numId + '-' + ilvl;
-                if (listCounters[counterKey] === undefined) {
-                  listCounters[counterKey] = lvlDef.start || 1;
-                } else {
-                  listCounters[counterKey]++;
-                }
-
-                // Reset sub-level counters when parent advances
-                const curIlvl = parseInt(ilvl, 10);
-                for (const key of Object.keys(listCounters)) {
-                  const [kNumId, kIlvl] = key.split('-');
-                  if (kNumId === numId && parseInt(kIlvl, 10) > curIlvl) {
-                    delete listCounters[key];
-                  }
-                }
-
-                const num = listCounters[counterKey];
-                const formatted = formatNumber(num, lvlDef.numFmt);
-                // Build level text by replacing placeholders
-                let text = lvlDef.lvlText;
-                text = text.replace(/%(\d+)/g, (_, lvlIdx) => {
-                  const li = parseInt(lvlIdx, 10) - 1;
-                  const k = numId + '-' + li;
-                  const val = listCounters[k] || lvlDef.start || 1;
-                  if (li === parseInt(ilvl, 10)) return formatted;
-                  return formatNumber(val, 'decimal');
-                });
-                listPrefix = indent + text + ' ';
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  // Extract runs
-  const text = extractRuns(pNode, relMap);
-
-  if (!text && !listPrefix) return '';
-
-  // Apply heading
-  if (headingLevel > 0 && headingLevel <= 6) {
-    return '#'.repeat(headingLevel) + ' ' + text;
-  }
-
-  return listPrefix + text;
-}
-
-// ─── Run extractor ──────────────────────────────────────────────
-
-function extractRuns(parentNode, relMap) {
-  let result = '';
-
-  for (const child of parentNode.children) {
-    const tag = child.localName || child.nodeName;
-
-    if (tag === 'r') {
-      result += processRun(child);
-    } else if (tag === 'hyperlink') {
-      const rId = child.getAttribute('r:id');
-      const url = (rId && relMap[rId]) ? relMap[rId].target : '';
-      let linkText = '';
-      for (const rc of child.children) {
-        if ((rc.localName || rc.nodeName) === 'r') {
-          linkText += processRun(rc, true);
-        }
-      }
-      if (url) {
-        result += '[' + linkText + '](' + url + ')';
-      } else {
-        result += linkText;
-      }
-    }
-  }
-
-  return result;
-}
-
-function processRun(rNode, skipFormatting) {
-  const rPr = getChild(rNode, 'w:rPr');
-  let text = '';
-
-  for (const child of rNode.children) {
-    const tag = child.localName || child.nodeName;
-    if (tag === 't') {
-      text += child.textContent;
-    } else if (tag === 'tab') {
-      text += '\t';
-    } else if (tag === 'br') {
-      text += '\n';
-    } else if (tag === 'sym') {
-      // Symbol characters — try to render as unicode
-      text += '\u2022'; // default to bullet
-    }
-  }
-
-  if (!text || skipFormatting) return text;
-
-  // Detect formatting
-  let bold = false, italic = false, strike = false, underline = false;
-
-  if (rPr) {
-    bold = hasToggleProp(rPr, 'w:b');
-    italic = hasToggleProp(rPr, 'w:i');
-    strike = hasToggleProp(rPr, 'w:strike') || hasToggleProp(rPr, 'w:dstrike');
-    const uEl = getChild(rPr, 'w:u');
-    if (uEl) {
-      const uVal = uEl.getAttribute('w:val');
-      underline = uVal && uVal !== 'none';
-    }
-  }
-
-  // Underline → bold (since md has no underline and Gemini needs to see emphasis)
-  if (underline) bold = true;
-
-  // Apply markdown formatting — order: strikethrough wraps bold wraps italic
-  if (italic) text = '*' + text + '*';
-  if (bold) text = '**' + text + '**';
-  if (strike) text = '~~' + text + '~~';
-
-  return text;
-}
-
-// ─── Table processor ────────────────────────────────────────────
-
-function processTable(tblNode, relMap) {
-  const rows = [];
-  for (const child of tblNode.children) {
-    const tag = child.localName || child.nodeName;
-    if (tag === 'tr') {
-      const cells = [];
-      for (const cell of child.children) {
-        if ((cell.localName || cell.nodeName) === 'tc') {
-          const cellParts = [];
-          for (const p of cell.children) {
-            if ((p.localName || p.nodeName) === 'p') {
-              cellParts.push(extractRuns(p, relMap));
-            }
-          }
-          cells.push(cellParts.join(' ').replace(/\|/g, '\\|'));
-        }
-      }
-      rows.push(cells);
-    }
-  }
-
-  if (rows.length === 0) return '';
-
-  const colCount = Math.max(...rows.map(r => r.length));
-  const mdLines = [];
-
-  for (let i = 0; i < rows.length; i++) {
-    const padded = rows[i].concat(Array(colCount - rows[i].length).fill(''));
-    mdLines.push('| ' + padded.join(' | ') + ' |');
-    if (i === 0) {
-      mdLines.push('| ' + padded.map(() => '---').join(' | ') + ' |');
-    }
-  }
-
-  return '\n' + mdLines.join('\n') + '\n';
-}
-
 // ─── Helpers ────────────────────────────────────────────────────
-
-function getChild(node, tagName) {
-  for (const c of node.children) {
-    if ((c.localName || c.nodeName) === tagName.split(':').pop() ||
-        c.nodeName === tagName) return c;
-  }
-  return null;
-}
-
-function hasToggleProp(rPr, propName) {
-  const el = getChild(rPr, propName);
-  if (!el) return false;
-  const val = el.getAttribute('w:val');
-  return val === null || val === '' || val === '1' || val === 'true';
-}
-
-function formatNumber(num, fmt) {
-  switch (fmt) {
-    case 'lowerLetter': return String.fromCharCode(96 + ((num - 1) % 26) + 1);
-    case 'upperLetter': return String.fromCharCode(64 + ((num - 1) % 26) + 1);
-    case 'lowerRoman': return toRoman(num).toLowerCase();
-    case 'upperRoman': return toRoman(num);
-    case 'decimal':
-    default: return String(num);
-  }
-}
-
-function toRoman(num) {
-  const vals = [1000,900,500,400,100,90,50,40,10,9,5,4,1];
-  const syms = ['M','CM','D','CD','C','XC','L','XL','X','IX','V','IV','I'];
-  let result = '';
-  for (let i = 0; i < vals.length; i++) {
-    while (num >= vals[i]) { result += syms[i]; num -= vals[i]; }
-  }
-  return result;
-}
 
 function collapseBlankLines(text) {
   return text.replace(/\n{3,}/g, '\n\n').trim() + '\n';
