@@ -370,55 +370,92 @@ async function convertDocxToMarkdown(file) {
 // paragraphs come out unnumbered. Do a final pass to detect whether
 // the output already has paragraph numbers (from the XML list machinery
 // or baked into the text itself) and, if not, inject them.
+//
+// Patent-document handling: when the text contains a "WHAT IS CLAIMED
+// IS" marker, numbering for the body ends there, the claim block that
+// follows restarts at 1, and numbering stops entirely once an "ABSTRACT"
+// section marker (or EOF) is reached. Headers are never numbered.
+
+// Matches common paragraph-number prefixes:
+//   "1.", "1)", "(1)", "1.1.", "1.1", "1.2.3", etc.
+const PARA_NUMBER_RE = /^\s*(\(?\d+(\.\d+)*[.)]|\d+(\.\d+)+)\s+\S/;
+
+function isTextParagraph(line) {
+  const trimmed = line.trim();
+  if (!trimmed) return false;
+  if (trimmed.startsWith('#')) return false;     // heading
+  if (trimmed.startsWith('|')) return false;     // table row/separator
+  if (/^[-*+]\s/.test(trimmed)) return false;    // bullet list
+  if (/^>\s/.test(trimmed)) return false;        // blockquote
+  return true;
+}
 
 function ensureParagraphNumbers(markdown) {
   const lines = markdown.split('\n');
 
-  // Matches common paragraph-number prefixes:
-  //   "1.", "1)", "(1)", "1.1.", "1.1", "1.2.3", etc.
-  const numberingPattern =
-    /^\s*(\(?\d+(\.\d+)*[.)]|\d+(\.\d+)+)\s+\S/;
+  // Detect patent-style section markers. Anchored to the start of the
+  // line (after optional markdown formatting) so we don't match the
+  // phrase when it appears mid-sentence.
+  const whatIsClaimedRe = /^[#>\s*_]*what\s+is\s+claimed\s+is\b/i;
+  const abstractRe = /^[#>\s*_]*abstract\b/i;
 
-  const isTextParagraph = (line) => {
-    const trimmed = line.trim();
-    if (!trimmed) return false;
-    if (trimmed.startsWith('#')) return false;     // heading
-    if (trimmed.startsWith('|')) return false;     // table row/separator
-    if (/^[-*+]\s/.test(trimmed)) return false;    // bullet list
-    if (/^>\s/.test(trimmed)) return false;        // blockquote
-    return true;
-  };
-
-  // Collect indices of candidate paragraph lines
-  const candidates = [];
+  let claimsStart = -1;
   for (let i = 0; i < lines.length; i++) {
+    if (whatIsClaimedRe.test(lines[i])) { claimsStart = i; break; }
+  }
+
+  let claimsEnd = lines.length;
+  if (claimsStart !== -1) {
+    for (let i = claimsStart + 1; i < lines.length; i++) {
+      if (abstractRe.test(lines[i])) { claimsEnd = i; break; }
+    }
+  }
+
+  // Region 1: body paragraphs (up to, but not including, the
+  // "WHAT IS CLAIMED IS" marker).
+  const bodyEnd = claimsStart === -1 ? lines.length : claimsStart;
+  numberRegion(lines, 0, bodyEnd);
+
+  // Region 2: claims block — restart counter at 1, stop at ABSTRACT/EOF.
+  // The marker line itself is skipped (start + 1).
+  if (claimsStart !== -1) {
+    numberRegion(lines, claimsStart + 1, claimsEnd);
+  }
+
+  // Region 3 (post-ABSTRACT) is intentionally left un-numbered.
+
+  return lines.join('\n');
+}
+
+function numberRegion(lines, start, end) {
+  // Collect indices of candidate paragraph lines in [start, end).
+  const candidates = [];
+  for (let i = start; i < end; i++) {
     if (isTextParagraph(lines[i])) candidates.push(i);
   }
 
-  // Nothing to do for trivially small documents
-  if (candidates.length < 2) return markdown;
+  // Nothing to do for trivially small regions.
+  if (candidates.length < 2) return;
 
   // How many already look numbered?
   const numberedCount = candidates.filter(
-    (i) => numberingPattern.test(lines[i])
+    (i) => PARA_NUMBER_RE.test(lines[i])
   ).length;
   const ratio = numberedCount / candidates.length;
 
-  // If a meaningful fraction already carries numbering, leave the
-  // document alone — the numbering machinery (or the author) handled it.
-  if (ratio >= 0.3) return markdown;
+  // If a meaningful fraction already carries numbering, leave this
+  // region alone — the numbering machinery (or the author) handled it.
+  if (ratio >= 0.3) return;
 
   // Otherwise inject paragraph numbers. Skip paragraphs that already
   // happen to start with a numbering prefix to avoid double-numbering.
   let counter = 1;
   for (const i of candidates) {
-    if (!numberingPattern.test(lines[i])) {
+    if (!PARA_NUMBER_RE.test(lines[i])) {
       lines[i] = counter + '. ' + lines[i];
     }
     counter++;
   }
-
-  return lines.join('\n');
 }
 
 // ─── Numbering parser ───────────────────────────────────────────
