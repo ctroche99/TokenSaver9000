@@ -3,8 +3,10 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>TokenSaver9000 — DOCX to Markdown</title>
+<title>TokenSaver9000 — DOCX/PDF to Markdown</title>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -180,13 +182,13 @@
 <body>
 
 <h1>TokenSaver9000</h1>
-<p class="subtitle">Convert .docx to clean Markdown — save tokens, keep formatting</p>
+<p class="subtitle">Convert .docx / .pdf to clean Markdown — save tokens, keep formatting</p>
 
 <div class="drop-zone" id="drop-zone">
-  <p>Drag &amp; drop a <strong>.docx</strong> file here</p>
+  <p>Drag &amp; drop a <strong>.docx</strong> or <strong>.pdf</strong> file here</p>
   <p>or <span class="browse" id="browse-btn">browse files</span></p>
 </div>
-<input type="file" id="file-input" accept=".docx">
+<input type="file" id="file-input" accept=".docx,.pdf">
 
 <div class="savings-banner" id="savings-banner">
   <div class="savings-pct" id="savings-pct"></div>
@@ -264,32 +266,39 @@ function showToast(msg) {
 
 // ─── Main handler ───────────────────────────────────────────────
 async function handleFile(file) {
-  if (!file.name.toLowerCase().endsWith('.docx')) {
-    showToast('Please upload a .docx file');
+  const lower = file.name.toLowerCase();
+  const isDocx = lower.endsWith('.docx');
+  const isPdf = lower.endsWith('.pdf');
+  if (!isDocx && !isPdf) {
+    showToast('Please upload a .docx or .pdf file');
     return;
   }
   currentFileName = file.name;
   fileNameEl.textContent = file.name;
 
   try {
-    const { markdown: md, xmlSize } = await convertDocxToMarkdown(file);
+    showToast(isPdf ? 'Processing PDF…' : 'Processing DOCX…');
+    const { markdown: md, sourceSize } = isPdf
+      ? await convertPdfToMarkdown(file)
+      : await convertDocxToMarkdown(file);
     mdOutput.value = md;
     outputArea.classList.add('visible');
 
     const mdSize = md.length;
     const mdTokens = Math.round(mdSize / 4);
-    const xmlTokens = Math.round(xmlSize / 4);
-    const saved = xmlSize - mdSize;
-    const savedPct = xmlSize > 0 ? Math.round((saved / xmlSize) * 100) : 0;
+    const srcTokens = Math.round(sourceSize / 4);
+    const saved = sourceSize - mdSize;
+    const savedPct = sourceSize > 0 ? Math.round((saved / sourceSize) * 100) : 0;
 
     statsEl.textContent = `${mdSize.toLocaleString()} chars · ~${mdTokens.toLocaleString()} tokens`;
 
+    const sourceLabel = isPdf ? 'PDF source' : 'XML source';
     savingsPct.textContent = `${savedPct}%`;
     savingsDetail.innerHTML =
-      `<span><strong>XML source:</strong> ~${xmlTokens.toLocaleString()} tokens (${xmlSize.toLocaleString()} chars)</span>` +
+      `<span><strong>${sourceLabel}:</strong> ~${srcTokens.toLocaleString()} tokens (${sourceSize.toLocaleString()} chars)</span>` +
       `<span><strong>Markdown:</strong> ~${mdTokens.toLocaleString()} tokens (${mdSize.toLocaleString()} chars)</span>` +
-      `<span><strong>Saved:</strong> ~${(xmlTokens - mdTokens).toLocaleString()} tokens</span>`;
-    savingsBar.style.width = savedPct + '%';
+      `<span><strong>Saved:</strong> ~${(srcTokens - mdTokens).toLocaleString()} tokens</span>`;
+    savingsBar.style.width = Math.max(0, savedPct) + '%';
     savingsBanner.classList.add('visible');
 
     showToast('Conversion complete');
@@ -305,14 +314,14 @@ async function convertDocxToMarkdown(file) {
   const arrayBuffer = await file.arrayBuffer();
   const zip = await JSZip.loadAsync(arrayBuffer);
 
-  let xmlSize = 0;
+  let sourceSize = 0;
   const styleNumMap = {};  // styleId → numId (explicit or inherited)
   const styleBaseMap = {}; // styleId → basedOn styleId
 
   // 1. Parse styles.xml — build styleId → numId map with basedOn inheritance
   if (zip.file('word/styles.xml')) {
     const stylesXmlStr = await zip.file('word/styles.xml').async('text');
-    xmlSize += stylesXmlStr.length;
+    sourceSize += stylesXmlStr.length;
     const stylesDoc = new DOMParser().parseFromString(stylesXmlStr, 'text/xml');
 
     const styles = stylesDoc.getElementsByTagName('w:style');
@@ -353,7 +362,7 @@ async function convertDocxToMarkdown(file) {
   const markdownOutput = [];
   if (zip.file('word/document.xml')) {
     const docXmlStr = await zip.file('word/document.xml').async('text');
-    xmlSize += docXmlStr.length;
+    sourceSize += docXmlStr.length;
     const documentDoc = new DOMParser().parseFromString(docXmlStr, 'text/xml');
 
     const listCounters = {};
@@ -423,25 +432,40 @@ async function convertDocxToMarkdown(file) {
 
         let isBold = false;
         let isItalic = false;
+        let isStrike = false;
+        let isUnderline = false;
         const rPrs = run.getElementsByTagName('w:rPr');
         if (rPrs.length > 0) {
           const rPr = rPrs[0];
-          if (rPr.getElementsByTagName('w:b').length > 0) isBold = true;
-          if (rPr.getElementsByTagName('w:i').length > 0) isItalic = true;
+          if (hasToggleProp(rPr, 'w:b')) isBold = true;
+          if (hasToggleProp(rPr, 'w:i')) isItalic = true;
+          if (hasToggleProp(rPr, 'w:strike') || hasToggleProp(rPr, 'w:dstrike')) {
+            isStrike = true;
+          }
+          const uEls = rPr.getElementsByTagName('w:u');
+          if (uEls.length > 0) {
+            const uVal = uEls[0].getAttribute('w:val');
+            if (uVal !== 'none' && uVal !== '0' && uVal !== 'false') {
+              isUnderline = true;
+            }
+          }
         }
 
-        // Wrap the non-whitespace core with markdown emphasis
+        // Markdown has no underline — promote to bold so emphasis survives.
+        if (isUnderline) isBold = true;
+
+        // Wrap the non-whitespace core with markdown emphasis.
+        // Nesting order: strike wraps bold wraps italic.
         if (runText.trim().length > 0) {
           const prefix = runText.match(/^\s*/)[0];
           const suffix = runText.match(/\s*$/)[0];
-          const core = runText.trim();
+          let core = runText.trim();
 
-          let formatted = core;
-          if (isBold && isItalic) formatted = '***' + formatted + '***';
-          else if (isBold) formatted = '**' + formatted + '**';
-          else if (isItalic) formatted = '*' + formatted + '*';
+          if (isItalic) core = '*' + core + '*';
+          if (isBold) core = '**' + core + '**';
+          if (isStrike) core = '~~' + core + '~~';
 
-          runText = prefix + formatted + suffix;
+          runText = prefix + core + suffix;
         }
 
         pText += runText;
@@ -456,7 +480,96 @@ async function convertDocxToMarkdown(file) {
   }
 
   const rawMarkdown = collapseBlankLines(markdownOutput.join('\n\n'));
-  return { markdown: ensureParagraphNumbers(rawMarkdown), xmlSize };
+  return { markdown: ensureParagraphNumbers(rawMarkdown), sourceSize };
+}
+
+// ─── PDF → Markdown converter ──────────────────────────────────
+// Uses pdf.js to extract the text layer page-by-page. If a page has
+// effectively no text (image-only scan), the page is rendered to a
+// canvas and run through Tesseract.js OCR.
+
+async function convertPdfToMarkdown(file) {
+  const arrayBuffer = await file.arrayBuffer();
+  const sourceSize = arrayBuffer.byteLength;
+
+  // pdf.js worker setup — match the CDN version loaded in <head>.
+  if (window.pdfjsLib && pdfjsLib.GlobalWorkerOptions) {
+    pdfjsLib.GlobalWorkerOptions.workerSrc =
+      'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  }
+
+  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const pageChunks = [];
+
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
+
+    // Try the embedded text layer first.
+    let pageText = await extractPdfPageText(page);
+
+    // If the page has essentially no extractable text, fall back to OCR.
+    if (pageText.replace(/\s+/g, '').length < 20) {
+      try {
+        pageText = await ocrPdfPage(page);
+      } catch (ocrErr) {
+        console.error('OCR failed on page ' + pageNum + ':', ocrErr);
+      }
+    }
+
+    pageChunks.push(pageText.trim());
+  }
+
+  const rawMarkdown = collapseBlankLines(pageChunks.join('\n\n'));
+  return { markdown: ensureParagraphNumbers(rawMarkdown), sourceSize };
+}
+
+async function extractPdfPageText(page) {
+  const textContent = await page.getTextContent();
+  // Group text items by rounded y so we can rebuild lines. PDF
+  // coordinates are bottom-up, so we sort y descending.
+  const lineMap = new Map();
+  for (const item of textContent.items) {
+    if (!item.str) continue;
+    const y = Math.round(item.transform[5]);
+    if (!lineMap.has(y)) lineMap.set(y, []);
+    lineMap.get(y).push(item);
+  }
+
+  const ys = Array.from(lineMap.keys()).sort((a, b) => b - a);
+  const lines = [];
+  for (const y of ys) {
+    const items = lineMap.get(y);
+    items.sort((a, b) => a.transform[4] - b.transform[4]);
+    const lineText = items.map((it) => it.str).join(' ').replace(/\s+/g, ' ').trim();
+    if (lineText) lines.push(lineText);
+  }
+  return lines.join('\n');
+}
+
+async function ocrPdfPage(page) {
+  if (!window.Tesseract) {
+    throw new Error('Tesseract.js not loaded');
+  }
+  // Render the page to a canvas at 2x scale for better OCR accuracy.
+  const viewport = page.getViewport({ scale: 2.0 });
+  const canvas = document.createElement('canvas');
+  canvas.width = viewport.width;
+  canvas.height = viewport.height;
+  const ctx = canvas.getContext('2d');
+  await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+
+  const { data } = await Tesseract.recognize(canvas, 'eng');
+  return (data && data.text) ? data.text : '';
+}
+
+// ─── Run-property helpers ───────────────────────────────────────
+
+function hasToggleProp(rPr, propName) {
+  const els = rPr.getElementsByTagName(propName);
+  if (els.length === 0) return false;
+  const val = els[0].getAttribute('w:val');
+  // Toggle properties: absent/empty/"1"/"true" = on; "0"/"false" = off.
+  return val === null || val === '' || val === '1' || val === 'true';
 }
 
 // ─── Paragraph numbering fallback ───────────────────────────────
