@@ -418,58 +418,8 @@ async function convertDocxToMarkdown(file) {
         }
       }
 
-      // Process text runs
-      let pText = '';
-      const runs = p.getElementsByTagName('w:r');
-      for (let j = 0; j < runs.length; j++) {
-        const run = runs[j];
-        let runText = '';
-        const textNodes = run.getElementsByTagName('w:t');
-        for (let k = 0; k < textNodes.length; k++) {
-          runText += textNodes[k].textContent;
-        }
-        if (!runText) continue;
-
-        let isBold = false;
-        let isItalic = false;
-        let isStrike = false;
-        let isUnderline = false;
-        const rPrs = run.getElementsByTagName('w:rPr');
-        if (rPrs.length > 0) {
-          const rPr = rPrs[0];
-          if (hasToggleProp(rPr, 'w:b')) isBold = true;
-          if (hasToggleProp(rPr, 'w:i')) isItalic = true;
-          if (hasToggleProp(rPr, 'w:strike') || hasToggleProp(rPr, 'w:dstrike')) {
-            isStrike = true;
-          }
-          const uEls = rPr.getElementsByTagName('w:u');
-          if (uEls.length > 0) {
-            const uVal = uEls[0].getAttribute('w:val');
-            if (uVal !== 'none' && uVal !== '0' && uVal !== 'false') {
-              isUnderline = true;
-            }
-          }
-        }
-
-        // Markdown has no underline — promote to bold so emphasis survives.
-        if (isUnderline) isBold = true;
-
-        // Wrap the non-whitespace core with markdown emphasis.
-        // Nesting order: strike wraps bold wraps italic.
-        if (runText.trim().length > 0) {
-          const prefix = runText.match(/^\s*/)[0];
-          const suffix = runText.match(/\s*$/)[0];
-          let core = runText.trim();
-
-          if (isItalic) core = '*' + core + '*';
-          if (isBold) core = '**' + core + '**';
-          if (isStrike) core = '~~' + core + '~~';
-
-          runText = prefix + core + suffix;
-        }
-
-        pText += runText;
-      }
+      // Extract text and inline math in document order
+      const pText = walkParagraph(p);
 
       // Only add paragraphs that actually have content or list markers
       const injectionText = tabText + paraNumberText;
@@ -481,6 +431,222 @@ async function convertDocxToMarkdown(file) {
 
   const rawMarkdown = collapseBlankLines(markdownOutput.join('\n\n'));
   return { markdown: ensureParagraphNumbers(rawMarkdown), sourceSize };
+}
+
+// ─── Paragraph walker (preserves document order across runs + math) ─
+
+// Walk direct children of a paragraph (or any container) in order,
+// dispatching w:r runs, m:oMath inline math, m:oMathPara block math,
+// and recursing into wrappers (hyperlinks, bookmarks, SDTs, etc.).
+function walkParagraph(node) {
+  let text = '';
+  for (const child of node.children) {
+    const tag = child.localName;
+    if (tag === 'r') {
+      text += processWRun(child);
+    } else if (tag === 'oMath') {
+      // Inline math — wrap in single dollar signs.
+      text += '$' + ommlToLatex(child) + '$';
+    } else if (tag === 'oMathPara') {
+      // Block/display math — collect inner oMath elements and wrap in $$.
+      const parts = [];
+      for (const c of child.children) {
+        if (c.localName === 'oMath') parts.push(ommlToLatex(c));
+      }
+      text += '\n$$' + parts.join('') + '$$\n';
+    } else if (tag !== 'pPr' && tag !== 'rPr') {
+      // Recurse into hyperlinks, smart tags, content controls, etc.
+      // Skip property nodes to avoid extracting text from formatting metadata.
+      text += walkParagraph(child);
+    }
+  }
+  return text;
+}
+
+function processWRun(run) {
+  let runText = '';
+  for (const c of run.children) {
+    const t = c.localName;
+    if (t === 't') {
+      runText += c.textContent;
+    } else if (t === 'tab') {
+      runText += '\t';
+    } else if (t === 'br') {
+      runText += '\n';
+    }
+  }
+  if (!runText) return '';
+
+  let isBold = false, isItalic = false, isStrike = false, isUnderline = false;
+  const rPr = getOMMLChild(run, 'rPr');  // works for w:rPr via localName
+  if (rPr) {
+    if (hasToggleProp(rPr, 'w:b')) isBold = true;
+    if (hasToggleProp(rPr, 'w:i')) isItalic = true;
+    if (hasToggleProp(rPr, 'w:strike') || hasToggleProp(rPr, 'w:dstrike')) isStrike = true;
+    const uEls = rPr.getElementsByTagName('w:u');
+    if (uEls.length > 0) {
+      const uVal = uEls[0].getAttribute('w:val');
+      if (uVal !== 'none' && uVal !== '0' && uVal !== 'false') isUnderline = true;
+    }
+  }
+
+  // Markdown has no underline — promote to bold so emphasis survives.
+  if (isUnderline) isBold = true;
+
+  // Wrap non-whitespace core only. Nesting order: strike > bold > italic.
+  if (runText.trim().length > 0) {
+    const prefix = runText.match(/^\s*/)[0];
+    const suffix = runText.match(/\s*$/)[0];
+    let core = runText.trim();
+    if (isItalic) core = '*' + core + '*';
+    if (isBold)   core = '**' + core + '**';
+    if (isStrike) core = '~~' + core + '~~';
+    runText = prefix + core + suffix;
+  }
+
+  return runText;
+}
+
+// ─── OMML → LaTeX converter ─────────────────────────────────────
+// Converts Office Math Markup Language (m:oMath) to LaTeX.
+// Covers the most common math structures; unknown elements fall back
+// to recursing into their children to extract whatever text is present.
+
+function ommlToLatex(node) {
+  let result = '';
+  for (const child of node.children) {
+    result += ommlNodeToLatex(child);
+  }
+  return result;
+}
+
+const NARY_MAP = {
+  '\u222B': '\\int', '\u222C': '\\iint', '\u222D': '\\iiint',
+  '\u222E': '\\oint', '\u2211': '\\sum',  '\u220F': '\\prod',
+  '\u2210': '\\coprod',
+};
+
+const ACCENT_MAP = {
+  '\u0302': '\\hat',  '\u0303': '\\tilde', '\u0307': '\\dot',
+  '\u0308': '\\ddot', '\u0305': '\\bar',   '\u20D7': '\\vec',
+};
+
+function ommlNodeToLatex(el) {
+  const tag = el.localName;
+  switch (tag) {
+    case 'r': { // m:r — math run (text)
+      let t = '';
+      for (const c of el.children) { if (c.localName === 't') t += c.textContent; }
+      return t;
+    }
+    case 'f': { // m:f — fraction
+      const num = getOMMLChild(el, 'num');
+      const den = getOMMLChild(el, 'den');
+      return '\\frac{' + (num ? ommlToLatex(num) : '') + '}{' + (den ? ommlToLatex(den) : '') + '}';
+    }
+    case 'rad': { // m:rad — radical / nth root
+      const deg = getOMMLChild(el, 'deg');
+      const e   = getOMMLChild(el, 'e');
+      const d   = deg ? ommlToLatex(deg).trim() : '';
+      return (d && d !== '0')
+        ? '\\sqrt[' + d + ']{' + (e ? ommlToLatex(e) : '') + '}'
+        : '\\sqrt{'  + (e ? ommlToLatex(e) : '') + '}';
+    }
+    case 'sSup': { // m:sSup — superscript
+      const e   = getOMMLChild(el, 'e');
+      const sup = getOMMLChild(el, 'sup');
+      return '{' + (e ? ommlToLatex(e) : '') + '}^{' + (sup ? ommlToLatex(sup) : '') + '}';
+    }
+    case 'sSub': { // m:sSub — subscript
+      const e   = getOMMLChild(el, 'e');
+      const sub = getOMMLChild(el, 'sub');
+      return '{' + (e ? ommlToLatex(e) : '') + '}_{' + (sub ? ommlToLatex(sub) : '') + '}';
+    }
+    case 'sSubSup': { // m:sSubSup — sub + superscript
+      const e   = getOMMLChild(el, 'e');
+      const sub = getOMMLChild(el, 'sub');
+      const sup = getOMMLChild(el, 'sup');
+      return '{' + (e   ? ommlToLatex(e)   : '') +
+             '}_{' + (sub ? ommlToLatex(sub) : '') +
+             '}^{' + (sup ? ommlToLatex(sup) : '') + '}';
+    }
+    case 'nary': { // m:nary — integral, sum, product, etc.
+      const pr  = getOMMLChild(el, 'naryPr');
+      const chrEl = pr ? getOMMLChild(pr, 'chr') : null;
+      const chr = chrEl ? (chrEl.getAttribute('m:val') || '\u222B') : '\u222B';
+      let cmd = NARY_MAP[chr] || '\\int';
+      const sub = getOMMLChild(el, 'sub');
+      const sup = getOMMLChild(el, 'sup');
+      const e   = getOMMLChild(el, 'e');
+      if (sub) cmd += '_{' + ommlToLatex(sub) + '}';
+      if (sup) cmd += '^{' + ommlToLatex(sup) + '}';
+      return cmd + (e ? ommlToLatex(e) : '');
+    }
+    case 'd': { // m:d — delimiter (parentheses, brackets, etc.)
+      const pr  = getOMMLChild(el, 'dPr');
+      const bEl = pr ? getOMMLChild(pr, 'begChr') : null;
+      const eEl = pr ? getOMMLChild(pr, 'endChr') : null;
+      const beg = bEl ? (bEl.getAttribute('m:val') || '(') : '(';
+      const end = eEl ? (eEl.getAttribute('m:val') || ')') : ')';
+      const inner = Array.from(el.children)
+        .filter(c => c.localName === 'e')
+        .map(c => ommlToLatex(c))
+        .join(', ');
+      return '\\left' + beg + inner + '\\right' + end;
+    }
+    case 'func': { // m:func — function application (sin, cos, …)
+      const fn = getOMMLChild(el, 'fName');
+      const e  = getOMMLChild(el, 'e');
+      return (fn ? ommlToLatex(fn) : '') + (e ? ommlToLatex(e) : '');
+    }
+    case 'limLow': { // m:limLow — lower limit
+      const e   = getOMMLChild(el, 'e');
+      const lim = getOMMLChild(el, 'lim');
+      return (e ? ommlToLatex(e) : '') + '_{' + (lim ? ommlToLatex(lim) : '') + '}';
+    }
+    case 'limUpp': { // m:limUpp — upper limit
+      const e   = getOMMLChild(el, 'e');
+      const lim = getOMMLChild(el, 'lim');
+      return (e ? ommlToLatex(e) : '') + '^{' + (lim ? ommlToLatex(lim) : '') + '}';
+    }
+    case 'acc': { // m:acc — accent (hat, tilde, dot, …)
+      const pr  = getOMMLChild(el, 'accPr');
+      const cEl = pr ? getOMMLChild(pr, 'chr') : null;
+      const chr = cEl ? (cEl.getAttribute('m:val') || '\u0302') : '\u0302';
+      const cmd = ACCENT_MAP[chr] || '\\hat';
+      const e   = getOMMLChild(el, 'e');
+      return cmd + '{' + (e ? ommlToLatex(e) : '') + '}';
+    }
+    case 'bar': { // m:bar — overline / underline
+      const pr  = getOMMLChild(el, 'barPr');
+      const pos = pr ? (getOMMLChild(pr, 'pos') || {}).getAttribute?.('m:val') : 'top';
+      const e   = getOMMLChild(el, 'e');
+      const inner = e ? ommlToLatex(e) : '';
+      return pos === 'bot' ? '\\underline{' + inner + '}' : '\\overline{' + inner + '}';
+    }
+    case 'm': { // m:m — matrix
+      const rows = [];
+      for (const mr of el.children) {
+        if (mr.localName !== 'mr') continue;
+        const cols = [];
+        for (const c of mr.children) {
+          if (c.localName === 'e') cols.push(ommlToLatex(c));
+        }
+        rows.push(cols.join(' & '));
+      }
+      return '\\begin{pmatrix}' + rows.join(' \\\\ ') + '\\end{pmatrix}';
+    }
+    default:
+      // Unknown element — recurse to extract whatever text is inside.
+      return ommlToLatex(el);
+  }
+}
+
+function getOMMLChild(node, localName) {
+  for (const c of node.children) {
+    if (c.localName === localName) return c;
+  }
+  return null;
 }
 
 // ─── PDF → Markdown converter ──────────────────────────────────
