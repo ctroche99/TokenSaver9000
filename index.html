@@ -366,71 +366,122 @@ async function convertDocxToMarkdown(file) {
     const documentDoc = new DOMParser().parseFromString(docXmlStr, 'text/xml');
 
     const listCounters = {};
-    const paragraphs = documentDoc.getElementsByTagName('w:p');
+    const body = documentDoc.getElementsByTagName('w:body')[0];
 
-    for (let i = 0; i < paragraphs.length; i++) {
-      const p = paragraphs[i];
-
-      let pNumId = '';
-      let pStyleId = '';
-      let pFirstLineIndent = '';
-
-      // Extract paragraph properties
-      const pPrs = p.getElementsByTagName('w:pPr');
-      if (pPrs.length > 0) {
-        const pPr = pPrs[0];
-        const numIds = pPr.getElementsByTagName('w:numId');
-        if (numIds.length > 0) pNumId = numIds[0].getAttribute('w:val') || '';
-
-        const pStyles = pPr.getElementsByTagName('w:pStyle');
-        if (pStyles.length > 0) pStyleId = pStyles[0].getAttribute('w:val') || '';
-
-        const inds = pPr.getElementsByTagName('w:ind');
-        if (inds.length > 0) {
-          pFirstLineIndent = inds[0].getAttribute('w:firstLine') || '';
+    if (body) {
+      for (const node of body.children) {
+        const tag = node.localName;
+        if (tag === 'p') {
+          const line = processParagraph(node, styleNumMap, listCounters);
+          if (line !== null) markdownOutput.push(line);
+        } else if (tag === 'tbl') {
+          const tbl = processTable(node);
+          if (tbl) markdownOutput.push(tbl);
         }
-      }
-
-      // Determine list context: explicit numId wins, then inherited from style.
-      const styleNum = styleNumMap[pStyleId] || '';
-      let listNum = '';
-
-      if (pNumId !== '') {
-        listNum = pNumId === '0' ? '' : pNumId;
-      } else if (styleNum !== '' && styleNum !== '0') {
-        listNum = styleNum;
-      }
-
-      let paraNumberText = '';
-      let tabText = '';
-
-      if (listNum !== '') {
-        listCounters[listNum] = (listCounters[listNum] || 0) + 1;
-        paraNumberText = listCounters[listNum] + '. ';
-      }
-
-      if (pFirstLineIndent !== '') {
-        const val = parseInt(pFirstLineIndent, 10);
-        if (!isNaN(val) && val > 0) {
-          // 1 inch = 1440 twips. 0.5 inches = 720 twips → one tab.
-          const numTabs = Math.round(val / 720.0);
-          if (numTabs > 0) tabText = '\t'.repeat(numTabs);
-        }
-      }
-
-      // Extract text and inline math in document order
-      const pText = walkParagraph(p);
-
-      // Only add paragraphs that actually have content or list markers
-      const injectionText = tabText + paraNumberText;
-      if (pText.trim() !== '' || paraNumberText !== '') {
-        markdownOutput.push(injectionText + pText);
       }
     }
   }
 
   const rawMarkdown = collapseBlankLines(markdownOutput.join('\n\n'));
   return { markdown: ensureParagraphNumbers(rawMarkdown), sourceSize };
+}
+
+// ─── Body-level element processors ─────────────────────────────────
+
+function processParagraph(p, styleNumMap, listCounters) {
+  let pNumId = '', pStyleId = '', pFirstLineIndent = '';
+
+  const pPrs = p.getElementsByTagName('w:pPr');
+  if (pPrs.length > 0) {
+    const pPr = pPrs[0];
+    const numIds = pPr.getElementsByTagName('w:numId');
+    if (numIds.length > 0) pNumId = numIds[0].getAttribute('w:val') || '';
+
+    const pStyles = pPr.getElementsByTagName('w:pStyle');
+    if (pStyles.length > 0) pStyleId = pStyles[0].getAttribute('w:val') || '';
+
+    const inds = pPr.getElementsByTagName('w:ind');
+    if (inds.length > 0) pFirstLineIndent = inds[0].getAttribute('w:firstLine') || '';
+  }
+
+  const styleNum = styleNumMap[pStyleId] || '';
+  let listNum = '';
+  if (pNumId !== '') {
+    listNum = pNumId === '0' ? '' : pNumId;
+  } else if (styleNum !== '' && styleNum !== '0') {
+    listNum = styleNum;
+  }
+
+  let paraNumberText = '', tabText = '';
+
+  if (listNum !== '') {
+    listCounters[listNum] = (listCounters[listNum] || 0) + 1;
+    paraNumberText = listCounters[listNum] + '. ';
+  }
+
+  if (pFirstLineIndent !== '') {
+    const val = parseInt(pFirstLineIndent, 10);
+    if (!isNaN(val) && val > 0) {
+      const numTabs = Math.round(val / 720.0);
+      if (numTabs > 0) tabText = '\t'.repeat(numTabs);
+    }
+  }
+
+  const pText = walkParagraph(p);
+  if (pText.trim() === '' && paraNumberText === '') return null;
+  return tabText + paraNumberText + pText;
+}
+
+function processTable(tblNode) {
+  const rows = [];
+  for (const tr of tblNode.children) {
+    if (tr.localName !== 'tr') continue;
+    const cells = [];
+    for (const tc of tr.children) {
+      if (tc.localName !== 'tc') continue;
+      const parts = [];
+      for (const child of tc.children) {
+        if (child.localName === 'p') {
+          const text = walkParagraph(child).trim();
+          if (text) parts.push(text);
+        } else if (child.localName === 'tbl') {
+          // Nested table — flatten all cell text to avoid invalid pipe-table nesting.
+          const nested = extractTableText(child);
+          if (nested) parts.push(nested);
+        }
+      }
+      cells.push(parts.join(' ').replace(/\|/g, '\\|'));
+    }
+    if (cells.length > 0) rows.push(cells);
+  }
+
+  if (rows.length === 0) return '';
+
+  const colCount = Math.max(...rows.map(r => r.length));
+  const mdLines = [];
+  for (let i = 0; i < rows.length; i++) {
+    const padded = [...rows[i], ...Array(colCount - rows[i].length).fill('')];
+    mdLines.push('| ' + padded.join(' | ') + ' |');
+    if (i === 0) mdLines.push('| ' + Array(colCount).fill('---').join(' | ') + ' |');
+  }
+  return '\n' + mdLines.join('\n') + '\n';
+}
+
+function extractTableText(tblNode) {
+  const parts = [];
+  for (const tr of tblNode.children) {
+    if (tr.localName !== 'tr') continue;
+    for (const tc of tr.children) {
+      if (tc.localName !== 'tc') continue;
+      for (const p of tc.children) {
+        if (p.localName === 'p') {
+          const t = walkParagraph(p).trim();
+          if (t) parts.push(t);
+        }
+      }
+    }
+  }
+  return parts.join('; ');
 }
 
 // ─── Paragraph walker (preserves document order across runs + math) ─
